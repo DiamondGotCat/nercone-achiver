@@ -41,8 +41,11 @@ class ArchiveManager:
         self.close()
 
     def close(self):
-        shutil.rmtree(self.temp_dir)
-        logger.log(f"Temporary directory {self.temp_dir} removed.")
+        try:
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+            logger.log(f"Temporary directory {self.temp_dir} removed.")
+        except Exception as e:
+            logger.log(f"Failed to remove temp dir: {e}", "WARN")
 
     def _get_format(self, path):
         name = os.path.basename(path).lower()
@@ -51,11 +54,29 @@ class ArchiveManager:
         if name.endswith('.tgz'): return 'tar.gz'
         return Path(path).suffix[1:].lower()
 
+    def _fix_zip_filename(self, member):
+        if member.flag_bits & 0x800:
+            return member
+
+        try:
+            raw_bytes = member.filename.encode('cp437')
+            try:
+                member.filename = raw_bytes.decode('cp932')
+            except UnicodeDecodeError:
+                try:
+                    member.filename = raw_bytes.decode('utf-8')
+                except UnicodeDecodeError:
+                    pass
+        except Exception:
+            pass
+
+        return member
+
     def import_archive(self, archive_path, password=None):
         if not Path(archive_path).exists():
             raise FileNotFoundError(f"Archive not found: {archive_path}")
 
-        self._imported_archive_path = archive_path
+        self._imported_archive_path = str(archive_path)
         fmt = self._get_format(archive_path)
         logger.log(f"Importing '{archive_path}' (format: {fmt})")
 
@@ -71,17 +92,21 @@ class ArchiveManager:
                     total_files = len(files)
                     bar = ModernProgressBar(total_files, "Import 7z")
 
-                    for fname in files:
-                        szf.extract(targets=[fname], path=self.temp_dir)
-                        bar.update(1)
+                    try:
+                        szf.extractall(path=self.temp_dir)
+                        bar.update(total_files)
+                    except Exception as e:
+                        logger.log(f"7z extractall failed: {e}", "ERROR")
+                        raise
                     bar.finish()
+
             elif fmt == 'rar':
                 if not rarfile: raise ImportError("rarfile is not installed.")
                 with rarfile.RarFile(archive_path, 'r', pwd=password) as rf:
                     members = rf.infolist()
                     total_files = len(members)
                     bar = ModernProgressBar(total_files, "Import Rar")
-                    
+
                     for member in members:
                         rf.extract(member, self.temp_dir)
                         bar.update(1)
@@ -92,9 +117,10 @@ class ArchiveManager:
             logger.log("Import successful.")
 
         except Exception as e:
-            if "password" in str(e).lower() or "encrypted" in str(e).lower() or isinstance(e, RuntimeError):
+            msg = str(e).lower()
+            if "password" in msg or "encrypted" in msg or "bad password" in msg or isinstance(e, RuntimeError):
                 self._is_encrypted_import = True
-                logger.log(f"Import failed (likely encryption): {e}", "WARN")
+                logger.log(f"Import failed (likely encryption or encoding): {e}", "WARN")
             else:
                 logger.log(f"Failed to import archive: {e}", "ERROR")
             raise
@@ -118,6 +144,7 @@ class ArchiveManager:
             bar = ModernProgressBar(total, "Import Zip")
 
             for member in members:
+                member = self._fix_zip_filename(member)
                 try:
                     zf.extract(member, self.temp_dir)
                     bar.update(1)
@@ -128,11 +155,14 @@ class ArchiveManager:
                             logger.log("ZIP is encrypted. Use password.", "WARN")
                             self._is_encrypted_import = True
                     raise
+                except Exception as e:
+                    logger.log(f"Failed to extract {member.filename}: {e}", "WARN")
+                    pass 
             bar.finish()
 
     def _import_tar_with_progress(self, archive_path, fmt):
         mode = "r:*"
-        with tarfile.open(archive_path, mode) as tf:
+        with tarfile.open(archive_path, mode, encoding='utf-8') as tf:
             members = tf.getmembers()
             total = len(members)
             bar = ModernProgressBar(total, f"Import {fmt.upper()}")
@@ -183,7 +213,6 @@ class ArchiveManager:
             encryption = pyzipper.WZ_AES
         elif self._password_for_export:
              logger.log("pyzipper not installed. Creating normal zip.", "WARN")
-             pass
 
         with opener(output_path, 'w', compression=compression, encryption=encryption) as zf:
             if self._password_for_export:
@@ -198,7 +227,7 @@ class ArchiveManager:
     def _export_tar_with_progress(self, output_path, fmt, file_list, total_files):
         mode = "w:gz" if "gz" in fmt else ("w:xz" if "xz" in fmt else "w")
         bar = ModernProgressBar(total_files, f"Export {fmt.upper()}")
-        
+
         with tarfile.open(output_path, mode) as tf:
             for file_path in file_list:
                 arcname = os.path.relpath(file_path, self.temp_dir)
@@ -220,8 +249,13 @@ class ArchiveManager:
 
             for item in os.listdir(self.temp_dir):
                 item_path = os.path.join(self.temp_dir, item)
-                if os.path.isfile(item_path): os.unlink(item_path)
-                elif os.path.isdir(item_path): shutil.rmtree(item_path)
+                try:
+                    if os.path.isfile(item_path) or os.path.islink(item_path):
+                        os.unlink(item_path)
+                    elif os.path.isdir(item_path):
+                        shutil.rmtree(item_path)
+                except Exception:
+                    pass
 
             self.import_archive(self._imported_archive_path, password=password)
             self._is_encrypted_import = False
@@ -229,11 +263,9 @@ class ArchiveManager:
             if self._password_for_export:
                 self._password_for_export = None
                 logger.log("Encryption for export has been disabled.")
-            else:
-                logger.log("Encryption for export was not enabled.")
 
     def _resolve_path(self, path_in_archive):
-        safe_path = os.path.normpath(path_in_archive).lstrip('/\\')
+        safe_path = os.path.normpath(str(path_in_archive)).lstrip(os.sep)
         full_path = Path(self.temp_dir) / safe_path
         if not str(full_path.resolve()).startswith(str(Path(self.temp_dir).resolve())):
             pass
@@ -254,15 +286,16 @@ class ArchiveManager:
         
         if source.is_dir():
             final_dest = dest_path / source.name
-            shutil.copytree(source, final_dest)
+            shutil.copytree(source, final_dest, dirs_exist_ok=True)
             if bar: bar.finish()
         else:
-            if dest_path.is_dir() or dest_path_in_archive.endswith('/'):
+            if dest_path.is_dir() or str(dest_path_in_archive).endswith(os.sep):
                  final_dest = dest_path
             else:
                  final_dest = dest_path.parent
             final_dest.mkdir(parents=True, exist_ok=True)
-            shutil.copy(source, final_dest / source.name if final_dest.is_dir() else final_dest)
+            target = final_dest / source.name if final_dest.is_dir() else final_dest
+            shutil.copy(source, target)
 
         logger.log(f"Added '{source_path}' to archive.")
 
