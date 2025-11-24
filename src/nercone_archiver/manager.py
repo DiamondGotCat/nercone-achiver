@@ -31,7 +31,8 @@ class ArchiveManager:
         self._password_for_export = None
         self._imported_archive_path = None
         self._is_encrypted_import = False
-        logger.log(f"ArchiveManager initialized. Temp directory: {self.temp_dir}")
+        logger.log("ArchiveManager initialized.")
+        logger.log(f"Temp directory: {self.temp_dir}")
 
     def __enter__(self):
         return self

@@ -9,7 +9,7 @@ from nercone_modern.color import ModernColor
 logger = ModernLogging("nyarchiver", show_level=False, show_proc=False)
 
 def interactive_mode():
-    logger.log("Entering Interactive Mode. Type 'help' for commands.", "INFO")
+    logger.log("Type 'help' for commands.", "INFO")
 
     current_archive = None
     mgr = ArchiveManager()
